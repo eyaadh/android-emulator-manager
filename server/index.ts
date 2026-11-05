@@ -298,6 +298,15 @@ let scrcpy: ChildProcess | undefined;
 let streamBusy = false;
 let streamError = '';
 let ffmpegLog = '';
+// A disconnected HTTP client ends FFmpeg's single-client listener. Keep the
+// requested stream running by rebuilding BOTH sides of the FIFO after exit.
+let streamDesired = false;
+let streamGeneration = 0;
+let restartTimer: ReturnType<typeof setTimeout> | undefined;
+let restartAttempts = 0;
+let streamStopping: Promise<void> = Promise.resolve();
+const RESTART_BASE_MS = 1500;
+const RESTART_MAX_MS = 15000;
 const appendLog = (chunk: Buffer) => {
   ffmpegLog = (ffmpegLog + chunk.toString()).slice(-12000);
 };
@@ -311,58 +320,88 @@ const toolCheck = async (binary: string, args: string[]) => {
 };
 const pipeCheck = async () => {
   try {
-    const st = statSync(PIPE);
-    return st.isFIFO();
+    return statSync(PIPE).isFIFO();
   } catch {
     return false;
   }
 };
-app.get('/api/stream/status', async (c) =>
-  c.json({
-    running:
-      !!ffmpeg &&
-      ffmpeg.exitCode === null &&
-      !!scrcpy &&
-      scrcpy.exitCode === null,
-    starting: streamBusy,
-    ffmpeg: !!ffmpeg && ffmpeg.exitCode === null,
-    scrcpy: !!scrcpy && scrcpy.exitCode === null,
-    url: STREAM_URL,
-    error: streamError,
-    log: ffmpegLog.slice(-3000),
-    tools: {
-      ffmpeg: await toolCheck(FFMPEG, ['-version']),
-      scrcpy: await toolCheck(SCRCPY, ['--version']),
-    },
-    pipeReady: await pipeCheck(),
-  })
-);
-const stopStream = async () => {
-  for (const child of [scrcpy, ffmpeg])
-    if (child && child.exitCode === null) child.kill('SIGTERM');
-  scrcpy = undefined;
-  ffmpeg = undefined;
+const isAlive = (child?: ChildProcess) =>
+  !!child && child.exitCode === null && child.signalCode === null;
+const waitForExit = (child: ChildProcess): Promise<void> =>
+  new Promise((done) => {
+    if (!isAlive(child)) return done();
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      done();
+    };
+    const timeout = setTimeout(() => {
+      if (child.pid && isAlive(child)) child.kill('SIGKILL');
+      finish();
+    }, 4000);
+    child.once('close', finish);
+    child.once('exit', finish);
+    if (child.pid) child.kill('SIGTERM');
+  });
+const clearRestart = () => {
+  if (restartTimer) clearTimeout(restartTimer);
+  restartTimer = undefined;
 };
-app.post('/api/stream/start', async (c) => {
-  if (streamBusy || ffmpeg || scrcpy)
-    return c.json({ error: 'Stream already running or starting' }, 409);
-  if (!(await connected()))
-    return c.json({ error: 'Start the emulator first' }, 409);
+const stopChildren = async () => {
+  // Serialize cleanup so a replacement never races an old HTTP listener.
+  streamStopping = streamStopping.then(async () => {
+    const children = [scrcpy, ffmpeg].filter(
+      (child): child is ChildProcess => !!child
+    );
+    scrcpy = undefined;
+    ffmpeg = undefined;
+    await Promise.all(children.map(waitForExit));
+  });
+  await streamStopping;
+};
+const stopStream = async () => {
+  streamDesired = false;
+  streamGeneration++;
+  clearRestart();
+  await stopChildren();
+  streamBusy = false;
+};
+const scheduleRecovery = (generation: number, reason: string) => {
+  if (!streamDesired || generation !== streamGeneration || restartTimer) return;
+  streamError = reason;
+  const delay = Math.min(
+    RESTART_BASE_MS * 2 ** Math.min(restartAttempts++, 4),
+    RESTART_MAX_MS
+  );
+  appendLog(Buffer.from(`\n[manager] ${reason}; restarting in ${delay}ms\n`));
+  restartTimer = setTimeout(() => {
+    restartTimer = undefined;
+    if (streamDesired && generation === streamGeneration)
+      void launchStream(generation);
+  }, delay);
+};
+async function launchStream(generation: number) {
+  if (!streamDesired || generation !== streamGeneration || streamBusy) return;
   streamBusy = true;
-  streamError = '';
-  ffmpegLog = '';
   try {
+    await stopChildren();
+    if (!streamDesired || generation !== streamGeneration) return;
+    if (!(await connected())) throw Error('Emulator is offline');
     if (
       !(await toolCheck(FFMPEG, ['-version'])) ||
       !(await toolCheck(SCRCPY, ['--version']))
     )
       throw Error('Install FFmpeg and scrcpy on Ubuntu first');
-    // Never replace a regular file or symlink with a FIFO.
+    // Never replace an existing regular file or symlink with a FIFO.
     if (existsSync(PIPE) && !(await pipeCheck()))
       throw Error(`STREAM_PIPE exists but is not a FIFO: ${PIPE}`);
     if (!existsSync(PIPE))
       await run('mkfifo', ['-m', '600', PIPE], { timeout: 5000 });
-    ffmpeg = spawn(
+    if (!streamDesired || generation !== streamGeneration) return;
+
+    const encoder = spawn(
       FFMPEG,
       [
         '-hide_banner',
@@ -392,18 +431,21 @@ app.post('/api/stream/start', async (c) => {
       ],
       { stdio: ['ignore', 'ignore', 'pipe'] }
     );
-    ffmpeg.stderr?.on('data', appendLog);
-    ffmpeg.on('error', (e) => {
-      streamError = `FFmpeg: ${e.message}`;
-      void stopStream();
-    });
-    ffmpeg.on('exit', (code) => {
-      if (ffmpeg) {
-        streamError ||= `FFmpeg exited (${code})`;
-        void stopStream();
-      }
-    });
-    scrcpy = spawn(
+    ffmpeg = encoder;
+    encoder.stderr?.on('data', appendLog);
+    const onFailure = (name: string, child: ChildProcess, reason: string) => {
+      if (!streamDesired || generation !== streamGeneration) return;
+      if (child !== ffmpeg && child !== scrcpy) return;
+      // A failure in either process requires restarting the whole pipeline.
+      scheduleRecovery(generation, `${name}: ${reason}`);
+      void stopChildren();
+    };
+    encoder.on('error', (e) => onFailure('FFmpeg', encoder, e.message));
+    encoder.on('exit', (code, signal) =>
+      onFailure('FFmpeg', encoder, `exited (${code ?? signal})`)
+    );
+
+    const recorder = spawn(
       SCRCPY,
       [
         '--serial',
@@ -421,33 +463,61 @@ app.post('/api/stream/start', async (c) => {
       ],
       { stdio: ['ignore', 'ignore', 'pipe'] }
     );
-    scrcpy.stderr?.on('data', (chunk) => {
-      ffmpegLog = (ffmpegLog + chunk.toString()).slice(-12000);
-    });
-    scrcpy.on('error', (e) => {
-      streamError = `scrcpy: ${e.message}`;
-      void stopStream();
-    });
-    scrcpy.on('exit', (code) => {
-      if (scrcpy) {
-        streamError ||= `scrcpy exited (${code})`;
-        void stopStream();
-      }
-    });
-    return c.json({
-      ok: true,
-      notice: 'Stream processes launched; connect VLC to the stream URL',
-      url: STREAM_URL,
-    });
+    scrcpy = recorder;
+    recorder.stderr?.on('data', appendLog);
+    recorder.on('error', (e) => onFailure('scrcpy', recorder, e.message));
+    recorder.on('exit', (code, signal) =>
+      onFailure('scrcpy', recorder, `exited (${code ?? signal})`)
+    );
+    streamError = '';
+    // A stable run resets exponential backoff, rather than penalizing normal
+    // viewer disconnects that occur minutes or hours later.
+    setTimeout(() => {
+      if (generation === streamGeneration && isAlive(ffmpeg) && isAlive(scrcpy))
+        restartAttempts = 0;
+    }, 30000).unref();
   } catch (e) {
-    await stopStream();
-    return c.json(
-      { error: e instanceof Error ? e.message : 'Stream start failed' },
-      500
+    scheduleRecovery(
+      generation,
+      e instanceof Error ? e.message : 'Stream start failed'
     );
   } finally {
     streamBusy = false;
   }
+}
+app.get('/api/stream/status', async (c) =>
+  c.json({
+    running: isAlive(ffmpeg) && isAlive(scrcpy),
+    starting: streamBusy || !!restartTimer,
+    ffmpeg: isAlive(ffmpeg),
+    scrcpy: isAlive(scrcpy),
+    url: STREAM_URL,
+    error: streamError,
+    log: ffmpegLog.slice(-3000),
+    tools: {
+      ffmpeg: await toolCheck(FFMPEG, ['-version']),
+      scrcpy: await toolCheck(SCRCPY, ['--version']),
+    },
+    pipeReady: await pipeCheck(),
+  })
+);
+app.post('/api/stream/start', async (c) => {
+  if (streamDesired || streamBusy)
+    return c.json({ error: 'Stream already running or starting' }, 409);
+  if (!(await connected()))
+    return c.json({ error: 'Start the emulator first' }, 409);
+  streamDesired = true;
+  streamError = '';
+  ffmpegLog = '';
+  restartAttempts = 0;
+  const generation = ++streamGeneration;
+  void launchStream(generation);
+  return c.json({
+    ok: true,
+    notice:
+      'Stream starting; disconnected viewers will be handled automatically',
+    url: STREAM_URL,
+  });
 });
 app.post('/api/stream/stop', async (c) => {
   await stopStream();
@@ -455,10 +525,14 @@ app.post('/api/stream/stop', async (c) => {
 });
 app.post('/api/stream/restart', async (c) => {
   await stopStream();
-  return c.json({
-    ok: true,
-    notice: 'Stopped. Click Start stream to relaunch.',
-  });
+  if (!(await connected()))
+    return c.json({ error: 'Start the emulator first' }, 409);
+  streamDesired = true;
+  streamError = '';
+  restartAttempts = 0;
+  const generation = ++streamGeneration;
+  void launchStream(generation);
+  return c.json({ ok: true, notice: 'Stream restarting', url: STREAM_URL });
 });
 let previousCpu = cpus().map((cpu) => ({ ...cpu.times }));
 app.get('/api/system/resources', (c) => {

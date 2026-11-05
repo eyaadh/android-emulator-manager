@@ -358,28 +358,35 @@ onUnmounted(() => {
               <span class="text-zinc-100">Emulator Control</span></span
             >
           </div>
-          <div
-            class="flex items-center gap-2 rounded-full border border-zinc-200 bg-zinc-50 px-3 py-1.5 text-xs dark:border-white/10 dark:bg-zinc-900"
-          >
+          <div class="ml-auto flex items-center gap-3">
             <span
-              class="size-2 rounded-full"
-              :class="ready ? 'bg-emerald-400' : 'bg-zinc-500'"
-            ></span
-            >{{ ready ? 'Device connected' : 'Device offline' }}
+              class="inline-flex items-center gap-2 rounded-full border border-zinc-200 bg-zinc-50 px-3 py-1.5 text-xs font-medium dark:border-white/10 dark:bg-zinc-900"
+            >
+              <span
+                class="size-2 rounded-full"
+                :class="ready ? 'bg-emerald-400' : 'bg-zinc-500'"
+              ></span>
+              {{ ready ? 'Device connected' : 'Device offline' }}
+            </span>
+            <button
+              class="btn btn-icon"
+              :title="theme === 'dark' ? 'Light mode' : 'Dark mode'"
+              :aria-label="
+                theme === 'dark'
+                  ? 'Switch to light mode'
+                  : 'Switch to dark mode'
+              "
+              @click="toggleTheme"
+            >
+              <Sun v-if="theme === 'dark'" :size="16" /><Moon
+                v-else
+                :size="16"
+              />
+            </button>
+            <button class="btn gap-2 text-xs" @click="logout">
+              <LogOut :size="15" /> Sign out
+            </button>
           </div>
-          <button
-            class="btn btn-icon ml-auto"
-            :title="theme === 'dark' ? 'Light mode' : 'Dark mode'"
-            :aria-label="
-              theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'
-            "
-            @click="toggleTheme"
-          >
-            <Sun v-if="theme === 'dark'" :size="16" /><Moon v-else :size="16" />
-          </button>
-          <button class="btn ml-3 gap-2 text-xs" @click="logout">
-            <LogOut :size="15" /> Sign out
-          </button>
         </header>
         <main class="mx-auto max-w-7xl space-y-7 px-5 py-8 md:px-9">
           <div class="flex flex-wrap items-start justify-between gap-4">
@@ -469,10 +476,21 @@ onUnmounted(() => {
                   </p>
                 </div>
                 <div class="flex items-center gap-2">
-                  <span class="pill">{{
-                    autoPreview ? 'Auto refresh' : 'Paused'
-                  }}</span
-                  ><button
+                  <span
+                    class="inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium"
+                    :class="
+                      autoPreview
+                        ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400'
+                        : 'border-zinc-200 bg-zinc-100 text-zinc-500 dark:border-white/10 dark:bg-zinc-800 dark:text-zinc-400'
+                    "
+                  >
+                    <span
+                      class="size-1.5 rounded-full"
+                      :class="autoPreview ? 'bg-emerald-500' : 'bg-zinc-400'"
+                    ></span>
+                    {{ autoPreview ? 'Auto refresh' : 'Paused' }}
+                  </span>
+                  <button
                     class="btn !min-h-9 px-3 text-xs"
                     @click="autoPreview = !autoPreview"
                   >
