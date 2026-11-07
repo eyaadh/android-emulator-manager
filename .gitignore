@@ -9,3 +9,4 @@ config/streamer.json
 *.log
 .DS_Store
 package-lock.json
+dist/
